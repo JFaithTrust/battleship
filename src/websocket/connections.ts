@@ -7,6 +7,7 @@ export interface ConnectionEntry {
     socket: WebSocket;
     request: IncomingMessage;
     createdAt: number;
+    userId?: string;
 }
 
 const clients = new Map<number, ConnectionEntry>();
@@ -21,6 +22,7 @@ export const connectionStore = {
             socket,
             request,
             createdAt: Date.now(),
+            userId: undefined,
         };
 
         clients.set(id, entry);
@@ -44,5 +46,29 @@ export const connectionStore = {
 
     list(): ConnectionEntry[] {
         return Array.from(clients.values());
+    },
+
+    setUser(connectionId: number, userId: string): void {
+        const entry = clients.get(connectionId);
+        if (!entry) {
+            return;
+        }
+        entry.userId = userId;
+    },
+
+    clearUser(connectionId: number): void {
+        const entry = clients.get(connectionId);
+        if (!entry) {
+            return;
+        }
+        entry.userId = undefined;
+    },
+
+    getUserId(connectionId: number): string | undefined {
+        return clients.get(connectionId)?.userId;
+    },
+
+    findByUserId(userId: string): ConnectionEntry | undefined {
+        return Array.from(clients.values()).find((entry) => entry.userId === userId);
     },
 };
