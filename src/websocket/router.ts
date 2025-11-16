@@ -57,6 +57,26 @@ const parseShipsPayload = (value: unknown): Ship[] | null => {
     return ships;
 };
 
+const parseCommandData = <T = unknown>(
+    message: WebSocketMessage,
+    connectionId: number,
+    commandName: string,
+): T | null => {
+    let payload: unknown = message.data;
+
+    if (typeof payload === 'string') {
+        try {
+            payload = JSON.parse(payload);
+        } catch (error) {
+            logError(`Failed to parse payload for "${commandName}"`, error);
+            sendError(connectionId, `Invalid JSON in "${commandName}" payload`, message.id);
+            return null;
+        }
+    }
+
+    return payload as T;
+};
+
 type GameSession = NonNullable<ReturnType<typeof gamesStore.getById>>;
 
 const forEachPlayerConnection = (
@@ -129,12 +149,17 @@ const requireAuthenticatedUser = (connectionId: number, messageId: number): stri
 };
 
 const handleReg: CommandHandler = async ({ message, connectionId }) => {
-    if (typeof message.data !== 'object' || message.data === null) {
+    const payload = parseCommandData<Partial<{ name: unknown; password: unknown }>>(message, connectionId, 'reg');
+    if (!payload) {
+        return;
+    }
+
+    if (typeof payload !== 'object' || payload === null) {
         sendError(connectionId, 'Invalid payload for "reg" command', message.id);
         return;
     }
 
-    const { name, password } = message.data as Partial<{ name: unknown; password: unknown }>;
+    const { name, password } = payload;
 
     if (typeof name !== 'string' || typeof password !== 'string') {
         sendError(connectionId, 'Name and password must be provided as strings', message.id);
@@ -187,12 +212,17 @@ const handleCreateRoom: CommandHandler = async ({ message, connectionId }) => {
 };
 
 const handleAddUserToRoom: CommandHandler = async ({ message, connectionId }) => {
-    if (typeof message.data !== 'object' || message.data === null) {
+    const payload = parseCommandData<Partial<{ indexRoom: unknown }>>(message, connectionId, 'add_user_to_room');
+    if (!payload) {
+        return;
+    }
+
+    if (typeof payload !== 'object' || payload === null) {
         sendError(connectionId, 'Invalid payload for "add_user_to_room" command', message.id);
         return;
     }
 
-    const { indexRoom } = message.data as Partial<{ indexRoom: unknown }>;
+    const { indexRoom } = payload;
 
     if (indexRoom === undefined || indexRoom === null) {
         sendError(connectionId, 'Room identifier is required', message.id);
@@ -245,16 +275,23 @@ const commandHandlers: Record<string, CommandHandler> = {
             return;
         }
 
-        if (typeof message.data !== 'object' || message.data === null) {
+        const payload = parseCommandData<
+            Partial<{
+                gameId: unknown;
+                ships: unknown;
+                indexPlayer: unknown;
+            }>
+        >(message, connectionId, 'add_ships');
+        if (!payload) {
+            return;
+        }
+
+        if (typeof payload !== 'object' || payload === null) {
             sendError(connectionId, 'Invalid payload for "add_ships"', message.id);
             return;
         }
 
-        const { gameId, ships, indexPlayer } = message.data as Partial<{
-            gameId: unknown;
-            ships: unknown;
-            indexPlayer: unknown;
-        }>;
+        const { gameId, ships, indexPlayer } = payload;
 
         if (gameId === undefined || ships === undefined || indexPlayer === undefined) {
             sendError(connectionId, 'Incomplete add_ships payload', message.id);
@@ -328,17 +365,24 @@ const commandHandlers: Record<string, CommandHandler> = {
             return;
         }
 
-        if (typeof message.data !== 'object' || message.data === null) {
+        const payload = parseCommandData<
+            Partial<{
+                gameId: unknown;
+                x: unknown;
+                y: unknown;
+                indexPlayer: unknown;
+            }>
+        >(message, connectionId, 'attack');
+        if (!payload) {
+            return;
+        }
+
+        if (typeof payload !== 'object' || payload === null) {
             sendError(connectionId, 'Invalid payload for "attack"', message.id);
             return;
         }
 
-        const { gameId, x, y, indexPlayer } = message.data as Partial<{
-            gameId: unknown;
-            x: unknown;
-            y: unknown;
-            indexPlayer: unknown;
-        }>;
+        const { gameId, x, y, indexPlayer } = payload;
 
         if (gameId === undefined || x === undefined || y === undefined || indexPlayer === undefined) {
             sendError(connectionId, 'Incomplete attack payload', message.id);
@@ -463,15 +507,17 @@ const commandHandlers: Record<string, CommandHandler> = {
             return;
         }
 
-        if (typeof message.data !== 'object' || message.data === null) {
+        const payload = parseCommandData<Partial<{ gameId: unknown; indexPlayer: unknown }>>(message, connectionId, 'randomAttack');
+        if (!payload) {
+            return;
+        }
+
+        if (typeof payload !== 'object' || payload === null) {
             sendError(connectionId, 'Invalid payload for "randomAttack"', message.id);
             return;
         }
 
-        const { gameId, indexPlayer } = message.data as Partial<{
-            gameId: unknown;
-            indexPlayer: unknown;
-        }>;
+        const { gameId, indexPlayer } = payload;
 
         if (gameId === undefined || indexPlayer === undefined) {
             sendError(connectionId, 'Incomplete randomAttack payload', message.id);

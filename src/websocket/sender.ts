@@ -6,6 +6,35 @@ type BroadcastOptions = {
     exclude?: number[];
 };
 
+const ensureJsonData = (payload: unknown): unknown => {
+    if (!payload || typeof payload !== 'object') {
+        return payload;
+    }
+
+    const message = payload as Record<string, unknown>;
+    if (!Object.prototype.hasOwnProperty.call(message, 'data')) {
+        return payload;
+    }
+
+    const currentData = message.data;
+    if (typeof currentData === 'string') {
+        return payload;
+    }
+
+    let serialized = '';
+    try {
+        serialized = JSON.stringify(currentData ?? null);
+    } catch (error) {
+        logError('Failed to serialize message data', error);
+        serialized = 'null';
+    }
+
+    return {
+        ...message,
+        data: serialized,
+    };
+};
+
 const trySend = (socket: WebSocket, payload: unknown, connectionId?: number): void => {
     if (socket.readyState !== WebSocket.OPEN) {
         const target = connectionId ? `connection#${connectionId}` : 'recipient';
@@ -14,9 +43,10 @@ const trySend = (socket: WebSocket, payload: unknown, connectionId?: number): vo
     }
 
     try {
-        const serialized = JSON.stringify(payload);
+        const outgoing = ensureJsonData(payload);
+        const serialized = JSON.stringify(outgoing);
         socket.send(serialized);
-        logCommand({ direction: 'OUT', connectionId, payload });
+        logCommand({ direction: 'OUT', connectionId, payload: outgoing });
     } catch (error) {
         const target = connectionId ? `connection#${connectionId}` : 'recipient';
         logError(`Failed to send message to ${target}`, error);

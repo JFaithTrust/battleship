@@ -11,7 +11,7 @@ export type Cell = { x: number; y: number };
 
 export interface Ship {
     position: Cell;
-    direction: boolean; /* true - horizontal? frontend uses boolean; keep as-is */
+    direction: boolean;
     length: number;
     type: string;
 }
@@ -46,8 +46,8 @@ const isWithinBoard = (cell: Cell): boolean =>
 const enumerateShipCells = (ship: Ship): Cell[] => {
     const cells: Cell[] = [];
     for (let i = 0; i < ship.length; i += 1) {
-        const x = ship.position.x + (ship.direction ? i : 0);
-        const y = ship.position.y + (ship.direction ? 0 : i);
+        const x = ship.position.x + (ship.direction ? 0 : i);
+        const y = ship.position.y + (ship.direction ? i : 0);
         cells.push({ x, y });
     }
     return cells;
