@@ -1,6 +1,7 @@
 import { userStore } from '../domain/users.js';
 import { roomsStore } from '../domain/rooms.js';
 import { gamesStore } from '../domain/games.js';
+import type { Ship, Cell } from '../domain/games.js';
 import { logError, logInfo } from '../utils/logger.js';
 import { broadcastAll, sendError, sendPersonal } from './sender.js';
 import { connectionStore } from './connections.js';
@@ -12,6 +13,64 @@ export interface WebSocketMessage {
 }
 
 type CommandHandler = (context: { message: WebSocketMessage; connectionId: number }) => Promise<void>;
+
+const parseShipsPayload = (value: unknown): Ship[] | null => {
+    if (!Array.isArray(value)) {
+        return null;
+    }
+
+    const ships: Ship[] = [];
+
+    for (const candidate of value) {
+        if (typeof candidate !== 'object' || candidate === null) {
+            return null;
+        }
+
+        const { position, direction, length, type } = candidate as Partial<{
+            position: unknown;
+            direction: unknown;
+            length: unknown;
+            type: unknown;
+        }>;
+
+        if (typeof direction !== 'boolean' || typeof length !== 'number' || typeof type !== 'string') {
+            return null;
+        }
+
+        if (typeof position !== 'object' || position === null) {
+            return null;
+        }
+
+        const { x, y } = position as Partial<{ x: unknown; y: unknown }>;
+        if (typeof x !== 'number' || typeof y !== 'number' || Number.isNaN(x) || Number.isNaN(y)) {
+            return null;
+        }
+
+        ships.push({
+            position: { x, y },
+            direction,
+            length,
+            type,
+        });
+    }
+
+    return ships;
+};
+
+type GameSession = NonNullable<ReturnType<typeof gamesStore.getById>>;
+
+const forEachPlayerConnection = (
+    game: GameSession,
+    callback: (connectionId: number, playerId: string, userId: string) => void,
+) => {
+    game.players.forEach((player) => {
+        const connection = connectionStore.findByUserId(player.userId);
+        if (!connection) {
+            return;
+        }
+        callback(connection.id, player.playerId, player.userId);
+    });
+};
 
 const buildLeaderboard = () =>
     userStore.listLeaderboard().map((entry) => ({
@@ -181,190 +240,281 @@ const commandHandlers: Record<string, CommandHandler> = {
     create_room: handleCreateRoom,
     add_user_to_room: handleAddUserToRoom,
     add_ships: async ({ message, connectionId }) => {
+        const userId = requireAuthenticatedUser(connectionId, message.id);
+        if (!userId) {
+            return;
+        }
+
         if (typeof message.data !== 'object' || message.data === null) {
             sendError(connectionId, 'Invalid payload for "add_ships"', message.id);
             return;
         }
 
-        const { gameId, ships, indexPlayer } = message.data as Partial<{ gameId: unknown; ships: unknown; indexPlayer: unknown }>;
+        const { gameId, ships, indexPlayer } = message.data as Partial<{
+            gameId: unknown;
+            ships: unknown;
+            indexPlayer: unknown;
+        }>;
 
-        if (typeof gameId !== 'string' || !Array.isArray(ships) || typeof indexPlayer !== 'string') {
-            sendError(connectionId, 'Invalid add_ships payload types', message.id);
+        if (gameId === undefined || ships === undefined || indexPlayer === undefined) {
+            sendError(connectionId, 'Incomplete add_ships payload', message.id);
             return;
         }
 
-        // store ships
-        try {
-            const ready = gamesStore.setPlayerShips(gameId, indexPlayer, ships as unknown as import('../domain/games.js').Ship[]);
+        const parsedShips = parseShipsPayload(ships);
+        if (!parsedShips) {
+            sendError(connectionId, 'Invalid ships format', message.id);
+            return;
+        }
 
-            sendPersonal(connectionId, {
-                type: 'add_ships',
-                data: { ok: true },
-                id: 0,
+        const resolvedGameId = String(gameId);
+        const resolvedPlayerId = String(indexPlayer);
+
+        const game = gamesStore.getById(resolvedGameId);
+        if (!game) {
+            sendError(connectionId, 'Game not found', message.id);
+            return;
+        }
+
+        const player = game.players.find((candidate) => candidate.playerId === resolvedPlayerId);
+        if (!player || player.userId !== userId) {
+            sendError(connectionId, 'Player not part of this game', message.id);
+            return;
+        }
+
+        try {
+            const ready = gamesStore.setPlayerShips(resolvedGameId, resolvedPlayerId, parsedShips);
+
+            if (!ready) {
+                return;
+            }
+
+            const starter = gamesStore.startGameIfReady(resolvedGameId);
+            const updatedGame = gamesStore.getById(resolvedGameId);
+            if (!updatedGame) {
+                return;
+            }
+
+            const currentTurn = updatedGame.currentPlayerId ?? starter ?? resolvedPlayerId;
+
+            forEachPlayerConnection(updatedGame, (targetConnectionId, targetPlayerId) => {
+                const personalShips = updatedGame.shipsByPlayer.get(targetPlayerId) ?? [];
+                sendPersonal(targetConnectionId, {
+                    type: 'start_game',
+                    data: {
+                        ships: personalShips,
+                        currentPlayerIndex: currentTurn,
+                    },
+                    id: 0,
+                });
             });
 
-            if (ready) {
-                const starter = gamesStore.startGameIfReady(gameId);
-                const game = gamesStore.getById(gameId)!;
-
-                // notify both players
-                game.players.forEach((p) => {
-                    const conn = connectionStore.findByUserId(p.userId);
-                    if (!conn) return;
-
-                    const myShips = game.shipsByPlayer.get(p.playerId) ?? [];
-                    sendPersonal(conn.id, {
-                        type: 'start_game',
-                        data: {
-                            ships: myShips,
-                            currentPlayerIndex: starter,
-                        },
-                        id: 0,
-                    });
+            forEachPlayerConnection(updatedGame, (targetConnectionId) => {
+                sendPersonal(targetConnectionId, {
+                    type: 'turn',
+                    data: { currentPlayer: currentTurn },
+                    id: 0,
                 });
-
-                // inform whose turn
-                if (starter) {
-                    const gameObj = gamesStore.getById(gameId)!;
-                    gameObj.players.forEach((p) => {
-                        const conn = connectionStore.findByUserId(p.userId);
-                        if (!conn) return;
-                        sendPersonal(conn.id, {
-                            type: 'turn',
-                            data: { currentPlayer: starter },
-                            id: 0,
-                        });
-                    });
-                }
-            }
-        } catch (err) {
-            logError('Error in add_ships handler', err);
-            sendError(connectionId, 'Server error while placing ships', message.id);
+            });
+        } catch (error) {
+            logError('Error in add_ships handler', error);
+            const errorText = error instanceof Error ? error.message : 'Server error while placing ships';
+            sendError(connectionId, errorText, message.id);
         }
     },
     attack: async ({ message, connectionId }) => {
+        const userId = requireAuthenticatedUser(connectionId, message.id);
+        if (!userId) {
+            return;
+        }
+
         if (typeof message.data !== 'object' || message.data === null) {
             sendError(connectionId, 'Invalid payload for "attack"', message.id);
             return;
         }
 
-        const { gameId, x, y, indexPlayer } = message.data as Partial<{ gameId: unknown; x: unknown; y: unknown; indexPlayer: unknown }>;
+        const { gameId, x, y, indexPlayer } = message.data as Partial<{
+            gameId: unknown;
+            x: unknown;
+            y: unknown;
+            indexPlayer: unknown;
+        }>;
 
-        if (typeof gameId !== 'string' || typeof x !== 'number' || typeof y !== 'number' || typeof indexPlayer !== 'string') {
-            sendError(connectionId, 'Invalid attack payload types', message.id);
+        if (gameId === undefined || x === undefined || y === undefined || indexPlayer === undefined) {
+            sendError(connectionId, 'Incomplete attack payload', message.id);
+            return;
+        }
+
+        if (typeof x !== 'number' || typeof y !== 'number' || Number.isNaN(x) || Number.isNaN(y)) {
+            sendError(connectionId, 'Invalid shot coordinates', message.id);
+            return;
+        }
+
+        const resolvedGameId = String(gameId);
+        const resolvedPlayerId = String(indexPlayer);
+
+        const game = gamesStore.getById(resolvedGameId);
+        if (!game) {
+            sendError(connectionId, 'Game not found', message.id);
+            return;
+        }
+
+        const player = game.players.find((candidate) => candidate.playerId === resolvedPlayerId);
+        if (!player || player.userId !== userId) {
+            sendError(connectionId, 'Player not part of this game', message.id);
             return;
         }
 
         try {
-            const result = gamesStore.handleAttack(gameId, indexPlayer, x, y);
-            const game = gamesStore.getById(gameId)!;
+            const result = gamesStore.handleAttack(resolvedGameId, resolvedPlayerId, x, y);
+            const updatedGame = gamesStore.getById(resolvedGameId);
+            if (!updatedGame) {
+                return;
+            }
 
-            // broadcast attack for main cell
-            game.players.forEach((p) => {
-                const conn = connectionStore.findByUserId(p.userId);
-                if (!conn) return;
-                sendPersonal(conn.id, {
+            const currentTurn = result.nextPlayerId;
+            const winnerPlayerId = result.winner;
+            const targetPosition: Cell = { x, y };
+
+            forEachPlayerConnection(updatedGame, (targetConnectionId) => {
+                sendPersonal(targetConnectionId, {
                     type: 'attack',
                     data: {
-                        position: { x, y },
-                        currentPlayer: result.nextPlayerId ?? game.currentPlayerId,
+                        position: targetPosition,
+                        currentPlayer: currentTurn,
                         status: result.status,
                     },
                     id: 0,
                 });
             });
 
-            // if killed, also send surrounding misses and killed cells
             if (result.status === 'killed') {
-                if (result.killedCells) {
-                    for (const c of result.killedCells) {
-                        game.players.forEach((p) => {
-                            const conn = connectionStore.findByUserId(p.userId);
-                            if (!conn) return;
-                            sendPersonal(conn.id, {
-                                type: 'attack',
-                                data: { position: c, currentPlayer: result.nextPlayerId ?? game.currentPlayerId, status: 'killed' },
-                                id: 0,
-                            });
+                const extraKilled = (result.killedCells ?? []).filter(
+                    (cell) => cell.x !== targetPosition.x || cell.y !== targetPosition.y,
+                );
+
+                extraKilled.forEach((cell) => {
+                    forEachPlayerConnection(updatedGame, (targetConnectionId) => {
+                        sendPersonal(targetConnectionId, {
+                            type: 'attack',
+                            data: {
+                                position: cell,
+                                currentPlayer: currentTurn,
+                                status: 'killed',
+                            },
+                            id: 0,
                         });
-                    }
-                }
-
-                if (result.surroundingMisses) {
-                    for (const c of result.surroundingMisses) {
-                        game.players.forEach((p) => {
-                            const conn = connectionStore.findByUserId(p.userId);
-                            if (!conn) return;
-                            sendPersonal(conn.id, {
-                                type: 'attack',
-                                data: { position: c, currentPlayer: result.nextPlayerId ?? game.currentPlayerId, status: 'miss' },
-                                id: 0,
-                            });
-                        });
-                    }
-                }
-            }
-
-            // send turn update
-            game.players.forEach((p) => {
-                const conn = connectionStore.findByUserId(p.userId);
-                if (!conn) return;
-                sendPersonal(conn.id, { type: 'turn', data: { currentPlayer: result.nextPlayerId ?? game.currentPlayerId }, id: 0 });
-            });
-
-            // if winner
-            if (result.winner) {
-                game.players.forEach((p) => {
-                    const conn = connectionStore.findByUserId(p.userId);
-                    if (!conn) return;
-                    sendPersonal(conn.id, { type: 'finish', data: { winPlayer: result.winner }, id: 0 });
+                    });
                 });
 
-                // update user wins
-                // map playerId -> userId
-                const winnerPlayer = game.players.find((pl) => pl.playerId === result.winner!);
+                (result.surroundingMisses ?? []).forEach((cell) => {
+                    forEachPlayerConnection(updatedGame, (targetConnectionId) => {
+                        sendPersonal(targetConnectionId, {
+                            type: 'attack',
+                            data: {
+                                position: cell,
+                                currentPlayer: currentTurn,
+                                status: 'miss',
+                            },
+                            id: 0,
+                        });
+                    });
+                });
+            }
+
+            forEachPlayerConnection(updatedGame, (targetConnectionId) => {
+                sendPersonal(targetConnectionId, {
+                    type: 'turn',
+                    data: { currentPlayer: currentTurn },
+                    id: 0,
+                });
+            });
+
+            if (winnerPlayerId) {
+                forEachPlayerConnection(updatedGame, (targetConnectionId) => {
+                    sendPersonal(targetConnectionId, {
+                        type: 'finish',
+                        data: { winPlayer: winnerPlayerId },
+                        id: 0,
+                    });
+                });
+
+                const winnerPlayer = updatedGame.players.find((entry) => entry.playerId === winnerPlayerId);
                 if (winnerPlayer) {
-                    // increment wins and broadcast leaderboard
-                        userStore.incrementWins(winnerPlayer.userId);
-                    // broadcast winners
+                    userStore.incrementWins(winnerPlayer.userId);
                     broadcastWinners();
                 }
+
+                gamesStore.delete(resolvedGameId);
+                updatedGame.players.forEach((entry) => {
+                    roomsStore.removeUser(entry.userId);
+                });
+                broadcastRooms();
             }
-        } catch (err) {
-            logError('Error in attack handler', err);
-            sendError(connectionId, 'Server error while processing attack', message.id);
+        } catch (error) {
+            logError('Error in attack handler', error);
+            const errorText = error instanceof Error ? error.message : 'Server error while processing attack';
+            sendError(connectionId, errorText, message.id);
         }
     },
     randomAttack: async ({ message, connectionId }) => {
-        // choose random available cell and reuse attack handler
+        const userId = requireAuthenticatedUser(connectionId, message.id);
+        if (!userId) {
+            return;
+        }
+
         if (typeof message.data !== 'object' || message.data === null) {
             sendError(connectionId, 'Invalid payload for "randomAttack"', message.id);
             return;
         }
 
-        const { gameId, indexPlayer } = message.data as Partial<{ gameId: unknown; indexPlayer: unknown }>;
+        const { gameId, indexPlayer } = message.data as Partial<{
+            gameId: unknown;
+            indexPlayer: unknown;
+        }>;
 
-        if (typeof gameId !== 'string' || typeof indexPlayer !== 'string') {
-            sendError(connectionId, 'Invalid randomAttack payload types', message.id);
+        if (gameId === undefined || indexPlayer === undefined) {
+            sendError(connectionId, 'Incomplete randomAttack payload', message.id);
             return;
         }
 
+        const resolvedGameId = String(gameId);
+        const resolvedPlayerId = String(indexPlayer);
+
         try {
-            const game = gamesStore.getById(gameId);
+            const game = gamesStore.getById(resolvedGameId);
             if (!game) {
                 sendError(connectionId, 'Game not found', message.id);
                 return;
             }
 
-            // pick random x,y within 10x10 grid (simple fallback)
-            const x = Math.floor(Math.random() * 10);
-            const y = Math.floor(Math.random() * 10);
+            const player = game.players.find((candidate) => candidate.playerId === resolvedPlayerId);
+            if (!player || player.userId !== userId) {
+                sendError(connectionId, 'Player not part of this game', message.id);
+                return;
+            }
 
-            // reuse attack
-            await commandHandlers.attack({ message: { type: 'attack', data: { gameId, x, y, indexPlayer }, id: 0 } as WebSocketMessage, connectionId });
-        } catch (err) {
-            logError('Error in randomAttack handler', err);
-            sendError(connectionId, 'Server error while processing randomAttack', message.id);
+            const available = gamesStore.getAvailableTargets(resolvedGameId, resolvedPlayerId);
+            if (available.length === 0) {
+                sendError(connectionId, 'No available cells for random attack', message.id);
+                return;
+            }
+
+            const randomIndex = Math.floor(Math.random() * available.length);
+            const target = available[randomIndex];
+
+            await commandHandlers.attack({
+                message: {
+                    type: 'attack',
+                    data: { gameId: resolvedGameId, x: target.x, y: target.y, indexPlayer: resolvedPlayerId },
+                    id: 0,
+                },
+                connectionId,
+            });
+        } catch (error) {
+            logError('Error in randomAttack handler', error);
+            const errorText = error instanceof Error ? error.message : 'Server error while processing randomAttack';
+            sendError(connectionId, errorText, message.id);
         }
     },
 };
