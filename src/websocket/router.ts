@@ -2,6 +2,7 @@ import { userStore } from '../domain/users.js';
 import { roomsStore } from '../domain/rooms.js';
 import { gamesStore } from '../domain/games.js';
 import type { Ship, Cell } from '../domain/games.js';
+import type { Room } from '../domain/rooms.js';
 import { logError, logInfo } from '../utils/logger.js';
 import { broadcastAll, sendError, sendPersonal } from './sender.js';
 import { connectionStore } from './connections.js';
@@ -13,6 +14,64 @@ export interface WebSocketMessage {
 }
 
 type CommandHandler = (context: { message: WebSocketMessage; connectionId: number }) => Promise<void>;
+
+const BOT_TURN_DELAY_MS = 600;
+const BOT_USER_PREFIX = 'bot-user';
+
+interface SinglePlayerSession {
+    botUserId: string;
+    botPlayerId: string;
+    timeout?: NodeJS.Timeout;
+}
+
+const singlePlayerGames = new Map<string, SinglePlayerSession>();
+
+const generateBotFleet = (): Ship[] => [
+    { position: { x: 0, y: 0 }, direction: true, length: 4, type: 'huge' },
+    { position: { x: 2, y: 0 }, direction: true, length: 3, type: 'large' },
+    { position: { x: 4, y: 0 }, direction: true, length: 3, type: 'large' },
+    { position: { x: 6, y: 0 }, direction: true, length: 2, type: 'medium' },
+    { position: { x: 8, y: 0 }, direction: true, length: 2, type: 'medium' },
+    { position: { x: 9, y: 2 }, direction: true, length: 2, type: 'medium' },
+    { position: { x: 1, y: 5 }, direction: false, length: 1, type: 'small' },
+    { position: { x: 3, y: 5 }, direction: false, length: 1, type: 'small' },
+    { position: { x: 5, y: 5 }, direction: false, length: 1, type: 'small' },
+    { position: { x: 7, y: 5 }, direction: false, length: 1, type: 'small' },
+];
+
+const registerSinglePlayerGame = (gameId: string, session: SinglePlayerSession): void => {
+    singlePlayerGames.set(gameId, session);
+};
+
+const getSinglePlayerSession = (gameId: string): SinglePlayerSession | undefined =>
+    singlePlayerGames.get(gameId);
+
+const cleanupSinglePlayerGame = (gameId: string): void => {
+    const session = singlePlayerGames.get(gameId);
+    if (!session) {
+        return;
+    }
+    if (session.timeout) {
+        clearTimeout(session.timeout);
+    }
+    singlePlayerGames.delete(gameId);
+};
+
+const scheduleBotTurn = (gameId: string, delay = BOT_TURN_DELAY_MS): void => {
+    const session = singlePlayerGames.get(gameId);
+    if (!session) {
+        return;
+    }
+
+    if (session.timeout) {
+        clearTimeout(session.timeout);
+    }
+
+    session.timeout = setTimeout(() => {
+        session.timeout = undefined;
+        performBotAttack(gameId);
+    }, delay);
+};
 
 const parseShipsPayload = (value: unknown): Ship[] | null => {
     if (!Array.isArray(value)) {
@@ -137,6 +196,140 @@ const broadcastRooms = () => {
         data,
         id: 0,
     });
+};
+
+const maybeTriggerBotTurn = (game: GameSession): void => {
+    const session = getSinglePlayerSession(game.id);
+    if (!session) {
+        return;
+    }
+
+    if (game.currentPlayerId !== session.botPlayerId) {
+        return;
+    }
+
+    scheduleBotTurn(game.id);
+};
+
+const resolveAttack = (gameId: string, attackerPlayerId: string, target: Cell): void => {
+    const result = gamesStore.handleAttack(gameId, attackerPlayerId, target.x, target.y);
+    const updatedGame = gamesStore.getById(gameId);
+    if (!updatedGame) {
+        return;
+    }
+
+    const currentTurn = result.nextPlayerId;
+    const winnerPlayerId = result.winner;
+
+    forEachPlayerConnection(updatedGame, (targetConnectionId) => {
+        sendPersonal(targetConnectionId, {
+            type: 'attack',
+            data: {
+                position: target,
+                currentPlayer: currentTurn,
+                status: result.status,
+            },
+            id: 0,
+        });
+    });
+
+    if (result.status === 'killed') {
+        const extraKilled = (result.killedCells ?? []).filter(
+            (cell) => cell.x !== target.x || cell.y !== target.y,
+        );
+
+        extraKilled.forEach((cell) => {
+            forEachPlayerConnection(updatedGame, (targetConnectionId) => {
+                sendPersonal(targetConnectionId, {
+                    type: 'attack',
+                    data: {
+                        position: cell,
+                        currentPlayer: currentTurn,
+                        status: 'killed',
+                    },
+                    id: 0,
+                });
+            });
+        });
+
+        (result.surroundingMisses ?? []).forEach((cell) => {
+            forEachPlayerConnection(updatedGame, (targetConnectionId) => {
+                sendPersonal(targetConnectionId, {
+                    type: 'attack',
+                    data: {
+                        position: cell,
+                        currentPlayer: currentTurn,
+                        status: 'miss',
+                    },
+                    id: 0,
+                });
+            });
+        });
+    }
+
+    forEachPlayerConnection(updatedGame, (targetConnectionId) => {
+        sendPersonal(targetConnectionId, {
+            type: 'turn',
+            data: { currentPlayer: currentTurn },
+            id: 0,
+        });
+    });
+
+    if (winnerPlayerId) {
+        forEachPlayerConnection(updatedGame, (targetConnectionId) => {
+            sendPersonal(targetConnectionId, {
+                type: 'finish',
+                data: { winPlayer: winnerPlayerId },
+                id: 0,
+            });
+        });
+
+        const winnerPlayer = updatedGame.players.find((entry) => entry.playerId === winnerPlayerId);
+        if (winnerPlayer) {
+            userStore.incrementWins(winnerPlayer.userId);
+            broadcastWinners();
+        }
+
+        cleanupSinglePlayerGame(gameId);
+        gamesStore.delete(gameId);
+        updatedGame.players.forEach((entry) => {
+            roomsStore.removeUser(entry.userId);
+        });
+        broadcastRooms();
+        return;
+    }
+
+    maybeTriggerBotTurn(updatedGame);
+};
+
+const performBotAttack = (gameId: string): void => {
+    const session = getSinglePlayerSession(gameId);
+    if (!session) {
+        return;
+    }
+
+    const game = gamesStore.getById(gameId);
+    if (!game) {
+        cleanupSinglePlayerGame(gameId);
+        return;
+    }
+
+    if (game.currentPlayerId !== session.botPlayerId) {
+        return;
+    }
+
+    try {
+        const availableTargets = gamesStore.getAvailableTargets(gameId, session.botPlayerId);
+        if (availableTargets.length === 0) {
+            return;
+        }
+
+        const randomIndex = Math.floor(Math.random() * availableTargets.length);
+        const target = availableTargets[randomIndex];
+        resolveAttack(gameId, session.botPlayerId, target);
+    } catch (error) {
+        logError('Bot attack failed', error);
+    }
 };
 
 const requireAuthenticatedUser = (connectionId: number, messageId: number): string | null => {
@@ -265,10 +458,72 @@ const handleAddUserToRoom: CommandHandler = async ({ message, connectionId }) =>
     });
 };
 
+const handleSinglePlay: CommandHandler = async ({ message, connectionId }) => {
+    const userId = requireAuthenticatedUser(connectionId, message.id);
+    if (!userId) {
+        return;
+    }
+
+    const existingGame = gamesStore.findGameByUserId(userId);
+    if (existingGame) {
+        sendError(connectionId, 'Finish current game before starting a new one', message.id);
+        return;
+    }
+
+    roomsStore.removeUser(userId);
+    broadcastRooms();
+
+    const timestamp = Date.now();
+    const botUserId = `${BOT_USER_PREFIX}-${timestamp}`;
+    const pseudoRoom: Room = {
+        id: `single-${timestamp}`,
+        users: [userId, botUserId],
+        status: 'in-game',
+        createdAt: timestamp,
+        updatedAt: timestamp,
+    };
+
+    const game = gamesStore.createFromRoom(pseudoRoom);
+    const humanPlayer = game.players.find((player) => player.userId === userId);
+    const botPlayer = game.players.find((player) => player.userId === botUserId);
+
+    if (!humanPlayer || !botPlayer) {
+        logError('Failed to initialise single player game');
+        gamesStore.delete(game.id);
+        sendError(connectionId, 'Unable to start single player game', message.id);
+        return;
+    }
+
+    registerSinglePlayerGame(game.id, {
+        botUserId,
+        botPlayerId: botPlayer.playerId,
+    });
+
+    try {
+        gamesStore.setPlayerShips(game.id, botPlayer.playerId, generateBotFleet());
+    } catch (error) {
+        logError('Failed to place bot ships', error);
+        cleanupSinglePlayerGame(game.id);
+        gamesStore.delete(game.id);
+        sendError(connectionId, 'Unable to start single player game', message.id);
+        return;
+    }
+
+    sendPersonal(connectionId, {
+        type: 'create_game',
+        data: {
+            idGame: game.id,
+            idPlayer: humanPlayer.playerId,
+        },
+        id: 0,
+    });
+};
+
 const commandHandlers: Record<string, CommandHandler> = {
     reg: handleReg,
     create_room: handleCreateRoom,
     add_user_to_room: handleAddUserToRoom,
+    single_play: handleSinglePlay,
     add_ships: async ({ message, connectionId }) => {
         const userId = requireAuthenticatedUser(connectionId, message.id);
         if (!userId) {
@@ -353,6 +608,8 @@ const commandHandlers: Record<string, CommandHandler> = {
                     id: 0,
                 });
             });
+
+            maybeTriggerBotTurn(updatedGame);
         } catch (error) {
             logError('Error in add_ships handler', error);
             const errorText = error instanceof Error ? error.message : 'Server error while placing ships';
@@ -410,91 +667,7 @@ const commandHandlers: Record<string, CommandHandler> = {
         }
 
         try {
-            const result = gamesStore.handleAttack(resolvedGameId, resolvedPlayerId, x, y);
-            const updatedGame = gamesStore.getById(resolvedGameId);
-            if (!updatedGame) {
-                return;
-            }
-
-            const currentTurn = result.nextPlayerId;
-            const winnerPlayerId = result.winner;
-            const targetPosition: Cell = { x, y };
-
-            forEachPlayerConnection(updatedGame, (targetConnectionId) => {
-                sendPersonal(targetConnectionId, {
-                    type: 'attack',
-                    data: {
-                        position: targetPosition,
-                        currentPlayer: currentTurn,
-                        status: result.status,
-                    },
-                    id: 0,
-                });
-            });
-
-            if (result.status === 'killed') {
-                const extraKilled = (result.killedCells ?? []).filter(
-                    (cell) => cell.x !== targetPosition.x || cell.y !== targetPosition.y,
-                );
-
-                extraKilled.forEach((cell) => {
-                    forEachPlayerConnection(updatedGame, (targetConnectionId) => {
-                        sendPersonal(targetConnectionId, {
-                            type: 'attack',
-                            data: {
-                                position: cell,
-                                currentPlayer: currentTurn,
-                                status: 'killed',
-                            },
-                            id: 0,
-                        });
-                    });
-                });
-
-                (result.surroundingMisses ?? []).forEach((cell) => {
-                    forEachPlayerConnection(updatedGame, (targetConnectionId) => {
-                        sendPersonal(targetConnectionId, {
-                            type: 'attack',
-                            data: {
-                                position: cell,
-                                currentPlayer: currentTurn,
-                                status: 'miss',
-                            },
-                            id: 0,
-                        });
-                    });
-                });
-            }
-
-            forEachPlayerConnection(updatedGame, (targetConnectionId) => {
-                sendPersonal(targetConnectionId, {
-                    type: 'turn',
-                    data: { currentPlayer: currentTurn },
-                    id: 0,
-                });
-            });
-
-            if (winnerPlayerId) {
-                forEachPlayerConnection(updatedGame, (targetConnectionId) => {
-                    sendPersonal(targetConnectionId, {
-                        type: 'finish',
-                        data: { winPlayer: winnerPlayerId },
-                        id: 0,
-                    });
-                });
-
-                const winnerPlayer = updatedGame.players.find((entry) => entry.playerId === winnerPlayerId);
-                if (winnerPlayer) {
-                    userStore.incrementWins(winnerPlayer.userId);
-                    broadcastWinners();
-                }
-
-                gamesStore.delete(resolvedGameId);
-                updatedGame.players.forEach((entry) => {
-                    roomsStore.removeUser(entry.userId);
-                });
-                broadcastRooms();
-            }
+            resolveAttack(resolvedGameId, resolvedPlayerId, { x, y });
         } catch (error) {
             logError('Error in attack handler', error);
             const errorText = error instanceof Error ? error.message : 'Server error while processing attack';
@@ -549,14 +722,7 @@ const commandHandlers: Record<string, CommandHandler> = {
             const randomIndex = Math.floor(Math.random() * available.length);
             const target = available[randomIndex];
 
-            await commandHandlers.attack({
-                message: {
-                    type: 'attack',
-                    data: { gameId: resolvedGameId, x: target.x, y: target.y, indexPlayer: resolvedPlayerId },
-                    id: 0,
-                },
-                connectionId,
-            });
+            resolveAttack(resolvedGameId, resolvedPlayerId, target);
         } catch (error) {
             logError('Error in randomAttack handler', error);
             const errorText = error instanceof Error ? error.message : 'Server error while processing randomAttack';
