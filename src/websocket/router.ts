@@ -180,6 +180,193 @@ const commandHandlers: Record<string, CommandHandler> = {
     reg: handleReg,
     create_room: handleCreateRoom,
     add_user_to_room: handleAddUserToRoom,
+    add_ships: async ({ message, connectionId }) => {
+        if (typeof message.data !== 'object' || message.data === null) {
+            sendError(connectionId, 'Invalid payload for "add_ships"', message.id);
+            return;
+        }
+
+        const { gameId, ships, indexPlayer } = message.data as Partial<{ gameId: unknown; ships: unknown; indexPlayer: unknown }>;
+
+        if (typeof gameId !== 'string' || !Array.isArray(ships) || typeof indexPlayer !== 'string') {
+            sendError(connectionId, 'Invalid add_ships payload types', message.id);
+            return;
+        }
+
+        // store ships
+        try {
+            const ready = gamesStore.setPlayerShips(gameId, indexPlayer, ships as unknown as import('../domain/games.js').Ship[]);
+
+            sendPersonal(connectionId, {
+                type: 'add_ships',
+                data: { ok: true },
+                id: 0,
+            });
+
+            if (ready) {
+                const starter = gamesStore.startGameIfReady(gameId);
+                const game = gamesStore.getById(gameId)!;
+
+                // notify both players
+                game.players.forEach((p) => {
+                    const conn = connectionStore.findByUserId(p.userId);
+                    if (!conn) return;
+
+                    const myShips = game.shipsByPlayer.get(p.playerId) ?? [];
+                    sendPersonal(conn.id, {
+                        type: 'start_game',
+                        data: {
+                            ships: myShips,
+                            currentPlayerIndex: starter,
+                        },
+                        id: 0,
+                    });
+                });
+
+                // inform whose turn
+                if (starter) {
+                    const gameObj = gamesStore.getById(gameId)!;
+                    gameObj.players.forEach((p) => {
+                        const conn = connectionStore.findByUserId(p.userId);
+                        if (!conn) return;
+                        sendPersonal(conn.id, {
+                            type: 'turn',
+                            data: { currentPlayer: starter },
+                            id: 0,
+                        });
+                    });
+                }
+            }
+        } catch (err) {
+            logError('Error in add_ships handler', err);
+            sendError(connectionId, 'Server error while placing ships', message.id);
+        }
+    },
+    attack: async ({ message, connectionId }) => {
+        if (typeof message.data !== 'object' || message.data === null) {
+            sendError(connectionId, 'Invalid payload for "attack"', message.id);
+            return;
+        }
+
+        const { gameId, x, y, indexPlayer } = message.data as Partial<{ gameId: unknown; x: unknown; y: unknown; indexPlayer: unknown }>;
+
+        if (typeof gameId !== 'string' || typeof x !== 'number' || typeof y !== 'number' || typeof indexPlayer !== 'string') {
+            sendError(connectionId, 'Invalid attack payload types', message.id);
+            return;
+        }
+
+        try {
+            const result = gamesStore.handleAttack(gameId, indexPlayer, x, y);
+            const game = gamesStore.getById(gameId)!;
+
+            // broadcast attack for main cell
+            game.players.forEach((p) => {
+                const conn = connectionStore.findByUserId(p.userId);
+                if (!conn) return;
+                sendPersonal(conn.id, {
+                    type: 'attack',
+                    data: {
+                        position: { x, y },
+                        currentPlayer: result.nextPlayerId ?? game.currentPlayerId,
+                        status: result.status,
+                    },
+                    id: 0,
+                });
+            });
+
+            // if killed, also send surrounding misses and killed cells
+            if (result.status === 'killed') {
+                if (result.killedCells) {
+                    for (const c of result.killedCells) {
+                        game.players.forEach((p) => {
+                            const conn = connectionStore.findByUserId(p.userId);
+                            if (!conn) return;
+                            sendPersonal(conn.id, {
+                                type: 'attack',
+                                data: { position: c, currentPlayer: result.nextPlayerId ?? game.currentPlayerId, status: 'killed' },
+                                id: 0,
+                            });
+                        });
+                    }
+                }
+
+                if (result.surroundingMisses) {
+                    for (const c of result.surroundingMisses) {
+                        game.players.forEach((p) => {
+                            const conn = connectionStore.findByUserId(p.userId);
+                            if (!conn) return;
+                            sendPersonal(conn.id, {
+                                type: 'attack',
+                                data: { position: c, currentPlayer: result.nextPlayerId ?? game.currentPlayerId, status: 'miss' },
+                                id: 0,
+                            });
+                        });
+                    }
+                }
+            }
+
+            // send turn update
+            game.players.forEach((p) => {
+                const conn = connectionStore.findByUserId(p.userId);
+                if (!conn) return;
+                sendPersonal(conn.id, { type: 'turn', data: { currentPlayer: result.nextPlayerId ?? game.currentPlayerId }, id: 0 });
+            });
+
+            // if winner
+            if (result.winner) {
+                game.players.forEach((p) => {
+                    const conn = connectionStore.findByUserId(p.userId);
+                    if (!conn) return;
+                    sendPersonal(conn.id, { type: 'finish', data: { winPlayer: result.winner }, id: 0 });
+                });
+
+                // update user wins
+                // map playerId -> userId
+                const winnerPlayer = game.players.find((pl) => pl.playerId === result.winner!);
+                if (winnerPlayer) {
+                    // increment wins and broadcast leaderboard
+                        userStore.incrementWins(winnerPlayer.userId);
+                    // broadcast winners
+                    broadcastWinners();
+                }
+            }
+        } catch (err) {
+            logError('Error in attack handler', err);
+            sendError(connectionId, 'Server error while processing attack', message.id);
+        }
+    },
+    randomAttack: async ({ message, connectionId }) => {
+        // choose random available cell and reuse attack handler
+        if (typeof message.data !== 'object' || message.data === null) {
+            sendError(connectionId, 'Invalid payload for "randomAttack"', message.id);
+            return;
+        }
+
+        const { gameId, indexPlayer } = message.data as Partial<{ gameId: unknown; indexPlayer: unknown }>;
+
+        if (typeof gameId !== 'string' || typeof indexPlayer !== 'string') {
+            sendError(connectionId, 'Invalid randomAttack payload types', message.id);
+            return;
+        }
+
+        try {
+            const game = gamesStore.getById(gameId);
+            if (!game) {
+                sendError(connectionId, 'Game not found', message.id);
+                return;
+            }
+
+            // pick random x,y within 10x10 grid (simple fallback)
+            const x = Math.floor(Math.random() * 10);
+            const y = Math.floor(Math.random() * 10);
+
+            // reuse attack
+            await commandHandlers.attack({ message: { type: 'attack', data: { gameId, x, y, indexPlayer }, id: 0 } as WebSocketMessage, connectionId });
+        } catch (err) {
+            logError('Error in randomAttack handler', err);
+            sendError(connectionId, 'Server error while processing randomAttack', message.id);
+        }
+    },
 };
 
 const validateMessage = (message: unknown): string | null => {
