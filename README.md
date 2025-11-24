@@ -11,13 +11,13 @@
 
 `npm run start:dev`
 
-* App served @ `http://localhost:8181` with nodemon
+* App served @ `http://localhost:8181` with live TypeScript recompilation via `tsx`
 
 **Production**
 
 `npm run start`
 
-* App served @ `http://localhost:8181` without nodemon
+* Builds TypeScript to `dist/` and serves @ `http://localhost:8181`
 
 ---
 
@@ -25,7 +25,11 @@
 
 Command | Description
 --- | ---
-`npm run start:dev` | App served @ `http://localhost:8181` with nodemon
-`npm run start` | App served @ `http://localhost:8181` without nodemon
+`npm run start:dev` | Start HTTP + WS servers with live TypeScript reload (`tsx watch`)
+`npm run start` | Compile TypeScript then run the production build from `dist/`
+`npm run build` | Compile TypeScript sources to `dist/`
+`npm run lint` | Run ESLint with TypeScript rules
+`npm run format` | Check code style with Prettier (no writes)
+`npm run format:write` | Format sources with Prettier
 
 **Note**: replace `npm` with `yarn` in `package.json` if you use yarn.
